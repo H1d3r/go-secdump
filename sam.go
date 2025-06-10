@@ -503,7 +503,7 @@ func getSysKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (sysKey []byt
 		return
 	}
 
-	fBytes, err := rpccon.QueryValue(hSubKey, "F")
+	fBytes, _, err := rpccon.QueryValue2(hSubKey, "F")
 	if err != nil {
 		log.Errorln(err)
 		rpccon.CloseKeyHandle(hSubKey)
@@ -644,7 +644,7 @@ func getNTHash(rpccon *msrrp.RPCCon, base []byte, rids []string, modifyDacl bool
 			return nil, err
 		}
 
-		v, err := rpccon.QueryValue(hSubKey, "V")
+		v, _, err := rpccon.QueryValue2(hSubKey, "V")
 		if err != nil {
 			log.Errorln(err)
 			rpccon.CloseKeyHandle(hSubKey)
@@ -871,7 +871,7 @@ func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 			return
 		}
 	}
-	data, err = rpccon.QueryValue(hSubKey, "")
+	data, _, err = rpccon.QueryValue2(hSubKey, "")
 	if err != nil {
 		log.Errorln(err)
 		rpccon.CloseKeyHandle(hSubKey)
@@ -893,7 +893,7 @@ func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 			}
 			return
 		}
-		data, err = rpccon.QueryValue(hSubKey, "")
+		data, _, err = rpccon.QueryValue2(hSubKey, "")
 		if err != nil {
 			log.Errorln(err)
 			rpccon.CloseKeyHandle(hSubKey)
@@ -971,7 +971,7 @@ func GetLSASecrets(rpccon *msrrp.RPCCon, base []byte, history, modifyDacl bool) 
 				return nil, err
 			}
 
-			value, err := rpccon.QueryValue(hSubKey, "")
+			value, _, err := rpccon.QueryValue2(hSubKey, "")
 			if err != nil {
 				log.Errorln(err)
 				rpccon.CloseKeyHandle(hSubKey)
@@ -1030,7 +1030,7 @@ func getNLKMSecretKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (resul
 		log.Errorln(err)
 		return
 	}
-	data, err := rpccon.QueryValue(hSubKey, "")
+	data, _, err := rpccon.QueryValue2(hSubKey, "")
 	if err != nil {
 		log.Errorln(err)
 		rpccon.CloseKeyHandle(hSubKey)
@@ -1099,7 +1099,7 @@ func GetCachedHashes(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 	iterationCount := 10240
 	if foundIterCount {
 		var tmpIterCount uint32
-		data, err := rpccon.QueryValue(hSubKey, `NL$IterationCount`)
+		data, _, err := rpccon.QueryValue2(hSubKey, `NL$IterationCount`)
 		if err != nil {
 			log.Errorln(err)
 			return nil, err
@@ -1124,7 +1124,7 @@ func GetCachedHashes(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 	}
 	for _, name := range names {
 		log.Debugf("Looking into %s\n", name)
-		data, err := rpccon.QueryValue(hSubKey, name)
+		data, _, err := rpccon.QueryValue2(hSubKey, name)
 		if err != nil {
 			log.Errorln(err)
 			return nil, err

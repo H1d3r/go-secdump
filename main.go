@@ -23,12 +23,15 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,16 +40,18 @@ import (
 	"golang.org/x/net/proxy"
 	"golang.org/x/term"
 
+	"github.com/jfjallid/go-smb/msdtyp"
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/dcerpc"
 	"github.com/jfjallid/go-smb/smb/dcerpc/msrrp"
+	"github.com/jfjallid/go-smb/smb/dcerpc/msscmr"
 	"github.com/jfjallid/go-smb/smb/encoder"
 	"github.com/jfjallid/go-smb/spnego"
 	"github.com/jfjallid/golog"
 )
 
 var log = golog.Get("")
-var release string = "0.5.0"
+var release string = "0.5.1"
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -57,7 +62,7 @@ var administratorsSID string = "S-1-5-32-544"
 var registryKeysModified []string
 
 // Map with all original security descriptors
-var m map[string]*msrrp.SecurityDescriptor
+var m map[string]*msdtyp.SecurityDescriptor
 
 var samSecretList = []printableSecret{}
 var lsaSecretList = []printableSecret{}
@@ -136,42 +141,43 @@ func startRemoteRegistry(session *smb.Connection, share string) (started, disabl
 	}
 	defer f.CloseFile()
 
-	bind, err := dcerpc.Bind(f, dcerpc.MSRPCUuidSvcCtl, dcerpc.MSRPCSvcCtlMajorVersion, dcerpc.MSRPCSvcCtlMinorVersion, dcerpc.MSRPCUuidNdr)
+	bind, err := dcerpc.Bind(f, msscmr.MSRPCUuidSvcCtl, msscmr.MSRPCSvcCtlMajorVersion, msscmr.MSRPCSvcCtlMinorVersion, dcerpc.MSRPCUuidNdr)
 	if err != nil {
 		log.Errorln("Failed to bind to service")
 		log.Errorln(err)
 		return
 	}
+	rpccon := msscmr.NewRPCCon(bind)
 
 	serviceName := "RemoteRegistry"
 
-	status, err := bind.GetServiceStatus(serviceName)
+	status, err := rpccon.GetServiceStatus(serviceName)
 	if err != nil {
 		log.Errorln(err)
 		return
 	} else {
-		if status == dcerpc.ServiceRunning {
+		if status == msscmr.ServiceRunning {
 			started = true
 			disabled = false
 			return
 		}
 		// Check if disabled
-		config, err := bind.GetServiceConfig(serviceName)
+		config, err := rpccon.GetServiceConfig(serviceName)
 		if err != nil {
 			log.Errorf("Failed to get config of %s service with error: %v\n", serviceName, err)
 			return started, disabled, err
 		}
-		if config.StartType == dcerpc.StartTypeStatusMap[dcerpc.ServiceDisabled] {
+		if config.StartType == msscmr.StartTypeStatusMap[msscmr.ServiceDisabled] {
 			disabled = true
 			// Enable service
-			err = bind.ChangeServiceConfig(serviceName, dcerpc.ServiceNoChange, dcerpc.ServiceDemandStart, dcerpc.ServiceNoChange, "", "", "", "")
+			err = rpccon.ChangeServiceConfig(serviceName, msscmr.ServiceNoChange, msscmr.ServiceDemandStart, msscmr.ServiceNoChange, "", "", "", "", "", "", 0)
 			if err != nil {
 				log.Errorf("Failed to change service config from Disabled to Start on Demand with error: %v\n", err)
 				return started, disabled, err
 			}
 		}
 		// Start service
-		err = bind.StartService(serviceName, nil)
+		err = rpccon.StartService(serviceName, nil)
 		if err != nil {
 			log.Errorln(err)
 			return started, disabled, err
@@ -190,17 +196,18 @@ func stopRemoteRegistry(session *smb.Connection, share string, disable bool) (er
 	}
 	defer f.CloseFile()
 
-	bind, err := dcerpc.Bind(f, dcerpc.MSRPCUuidSvcCtl, dcerpc.MSRPCSvcCtlMajorVersion, dcerpc.MSRPCSvcCtlMinorVersion, dcerpc.MSRPCUuidNdr)
+	bind, err := dcerpc.Bind(f, msscmr.MSRPCUuidSvcCtl, msscmr.MSRPCSvcCtlMajorVersion, msscmr.MSRPCSvcCtlMinorVersion, dcerpc.MSRPCUuidNdr)
 	if err != nil {
 		log.Errorln("Failed to bind to service")
 		log.Errorln(err)
 		return
 	}
+	rpccon := msscmr.NewRPCCon(bind)
 
 	serviceName := "RemoteRegistry"
 
 	// Stop service
-	err = bind.ControlService(serviceName, dcerpc.ServiceControlStop)
+	err = rpccon.ControlService(serviceName, msscmr.ServiceControlStop)
 	if err != nil {
 		log.Errorln(err)
 		return
@@ -208,7 +215,7 @@ func stopRemoteRegistry(session *smb.Connection, share string, disable bool) (er
 	log.Infoln("Service RemoteRegistry stopped")
 
 	if disable {
-		err = bind.ChangeServiceConfig(serviceName, dcerpc.ServiceNoChange, dcerpc.ServiceDisabled, dcerpc.ServiceNoChange, "", "", "", "")
+		err = rpccon.ChangeServiceConfig(serviceName, msscmr.ServiceNoChange, msscmr.ServiceDisabled, msscmr.ServiceNoChange, "", "", "", "", "", "", 0)
 		if err != nil {
 			log.Errorf("Failed to change service config to Disabled with error: %v\n", err)
 			return
@@ -221,7 +228,7 @@ func stopRemoteRegistry(session *smb.Connection, share string, disable bool) (er
 
 func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string) error {
 	if m == nil {
-		m = make(map[string]*msrrp.SecurityDescriptor)
+		m = make(map[string]*msdtyp.SecurityDescriptor)
 	}
 
 	for _, subkey := range keys {
@@ -247,11 +254,11 @@ func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string) er
 			return err
 		}
 
-		sd2 := msrrp.SecurityDescriptor{
-			OwnerSid: &msrrp.SID{},
-			GroupSid: &msrrp.SID{},
-			Sacl:     &msrrp.PACL{},
-			Dacl:     &msrrp.PACL{},
+		sd2 := msdtyp.SecurityDescriptor{
+			OwnerSid: &msdtyp.SID{},
+			GroupSid: &msdtyp.SID{},
+			Sacl:     &msdtyp.PACL{},
+			Dacl:     &msdtyp.PACL{},
 		}
 		err = sd2.UnmarshalBinary(sdBytes)
 		if err != nil {
@@ -279,7 +286,7 @@ func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string) er
 		}
 
 		mask := msrrp.PermWriteDacl | msrrp.PermReadControl | msrrp.PermKeyEnumerateSubKeys | msrrp.PermKeyQueryValue
-		ace, err := msrrp.NewAce(sid, mask, msrrp.AccessAllowedAceType, msrrp.ContainerInheritAce)
+		ace, err := msrrp.NewAce(sid, mask, msdtyp.AccessAllowedAceType, msdtyp.ContainerInheritAce)
 		if err != nil {
 			rpccon.CloseKeyHandle(hSubKey)
 			delete(m, subkey)
@@ -287,7 +294,7 @@ func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string) er
 			return err
 		}
 		// NOTE Can't set owner, group or SACL, since I only have WriteDacl on SAM\SAM
-		newSd, err := msrrp.NewSecurityDescriptor(sd.Control, nil, nil, msrrp.NewACL(append([]msrrp.ACE{*ace}, sd.Dacl.ACLS...)), nil)
+		newSd, err := msrrp.NewSecurityDescriptor(sd.Control, nil, nil, msrrp.NewACL(append([]msdtyp.ACE{*ace}, sd.Dacl.ACLS...)), nil)
 
 		log.Infof("Changing Dacl for key: %s\n", subkey)
 		err = rpccon.SetKeySecurity(hSubKey, newSd)
@@ -309,7 +316,7 @@ func revertDacl(rpccon *msrrp.RPCCon, base []byte, keys []string) error {
 		return err
 	}
 
-	var sd *msrrp.SecurityDescriptor
+	var sd *msdtyp.SecurityDescriptor
 	var ok bool
 	for _, subkey := range keys {
 		if sd, ok = m[subkey]; !ok {
@@ -323,7 +330,7 @@ func revertDacl(rpccon *msrrp.RPCCon, base []byte, keys []string) error {
 			continue // Try to change as many keys as possible
 		}
 
-		sd.Control &^= msrrp.SecurityDescriptorFlagSP
+		sd.Control &^= msdtyp.SecurityDescriptorFlagSP
 		sd.OffsetSacl = 0
 		sd.OwnerSid = nil
 		sd.GroupSid = nil
@@ -343,7 +350,7 @@ func revertDacl(rpccon *msrrp.RPCCon, base []byte, keys []string) error {
 }
 
 func restoreDaclFromBackup(rpccon *msrrp.RPCCon, hKey []byte) error {
-	daclMap := make(map[string]*msrrp.SecurityDescriptor)
+	daclMap := make(map[string]*msdtyp.SecurityDescriptor)
 	keys := []string{}
 
 	if daclBackupFile == nil {
@@ -353,11 +360,11 @@ func restoreDaclFromBackup(rpccon *msrrp.RPCCon, hKey []byte) error {
 	}
 	scanner := bufio.NewScanner(daclBackupFile)
 	for scanner.Scan() {
-		sd := msrrp.SecurityDescriptor{
-			OwnerSid: &msrrp.SID{},
-			GroupSid: &msrrp.SID{},
-			Sacl:     &msrrp.PACL{},
-			Dacl:     &msrrp.PACL{},
+		sd := msdtyp.SecurityDescriptor{
+			OwnerSid: &msdtyp.SID{},
+			GroupSid: &msdtyp.SID{},
+			Sacl:     &msdtyp.PACL{},
+			Dacl:     &msdtyp.PACL{},
 		}
 		line := scanner.Text()
 		parts := strings.Split(line, ":")
@@ -741,48 +748,51 @@ var helpMsg = `
     Usage: ` + os.Args[0] + ` [options]
 
     options:
-          --host <target>       Hostname or ip address of remote server. Must be hostname when using Kerberos
-      -P, --port <port>         SMB Port (default 445)
-      -d, --domain <domain>     Domain name to use for login
-      -u, --user <username>     Username
-      -p, --pass <pass>         Password
-      -n, --no-pass             Disable password prompt and send no credentials
-          --hash <NT Hash>      Hex encoded NT Hash for user password
-          --local               Authenticate as a local user instead of domain user
-      -k, --kerberos            Use Kerberos authentication. (KRB5CCNAME will be checked on Linux)
-          --dc-ip               Optionally specify ip of KDC when using Kerberos authentication
-          --target-ip           Optionally specify ip of target when using Kerberos authentication
-          --aes-key             Use a hex encoded AES128/256 key for Kerberos authentication
-          --dump                Saves the SAM and SECURITY hives to disk and
-                                transfers them to the local machine.
-          --sam                 Extract secrets from the SAM hive explicitly. Only other explicit targets are included.
-          --lsa                 Extract LSA secrets explicitly. Only other explicit targets are included.
-          --dcc2                Extract DCC2 caches explicitly. Only ohter explicit targets are included.
-          --modify-dacl         Change DACLs of reg keys before dump.
-                                Only required if keys cannot be opened using SeBackupPrivilege. (default false)
-          --backup-dacl         Save original DACLs to disk before modification
-          --restore-dacl        Restore DACLs using disk backup. Could be useful if automated restore fails.
-          --backup-file         Filename for DACL backup (default dacl.backup)
-          --relay               Start an SMB listener that will relay incoming
-                                NTLM authentications to the remote server and
-                                use that connection. NOTE that this forces SMB 2.1
-                                without encryption.
-          --relay-port <port>   Listening port for relay (default 445)
-          --socks-host <target> Establish connection via a SOCKS5 proxy server
-          --socks-port <port>   SOCKS5 proxy port (default 1080)
-      -t, --timeout             Dial timeout in seconds (default 5)
-          --noenc               Disable smb encryption
-          --smb2                Force smb 2.1
-          --debug               Enable debug logging
-          --verbose             Enable verbose logging
-      -o, --output              Filename for writing results (default is stdout). Will append to file if it exists.
-      -v, --version             Show version
+          --host <target>        Hostname or ip address of remote server. Must be hostname when using Kerberos
+      -P, --port <port>          SMB Port (default 445)
+      -d, --domain <domain>      Domain name to use for login
+      -u, --user <username>      Username
+      -p, --pass <pass>          Password
+      -n, --no-pass              Disable password prompt and send no credentials
+          --hash <NT Hash>       Hex encoded NT Hash for user password
+          --local                Authenticate as a local user instead of domain user
+      -k, --kerberos             Use Kerberos authentication. (KRB5CCNAME will be checked on Linux)
+          --dc-ip <ip>           Optionally specify ip of KDC when using Kerberos authentication
+          --target-ip <ip>       Optionally specify ip of target when using Kerberos authentication
+          --aes-key <hex>        Use a hex encoded AES128/256 key for Kerberos authentication
+          --dns-host <ip[:port]> Override system's default DNS resolver
+          --dns-tcp              Force DNS lookups over TCP. Default true when using --socks-host
+          --dump                 Saves the SAM and SECURITY hives to disk and
+                                 transfers them to the local machine.
+          --sam                  Extract secrets from the SAM hive explicitly. Only other explicit targets are included.
+          --lsa                  Extract LSA secrets explicitly. Only other explicit targets are included.
+          --dcc2                 Extract DCC2 caches explicitly. Only other explicit targets are included.
+          --modify-dacl          Change DACLs of reg keys before dump.
+                                 Only required if keys cannot be opened using SeBackupPrivilege. (default false)
+          --backup-dacl          Save original DACLs to disk before modification
+          --restore-dacl         Restore DACLs using disk backup. Could be useful if automated restore fails.
+          --backup-file <file>   Filename for DACL backup (default dacl.backup)
+          --relay                Start an SMB listener that will relay incoming
+                                 NTLM authentications to the remote server and
+                                 use that connection. NOTE that this forces SMB 2.1
+                                 without encryption.
+          --relay-port <port>    Listening port for relay (default 445)
+          --socks-host <target>  Establish connection via a SOCKS5 proxy server
+          --socks-port <port>    SOCKS5 proxy port (default 1080)
+      -t, --timeout <duration>   Dial timeout in format 5s or 2m (default 5s)
+          --noenc                Disable smb encryption
+          --smb2                 Force smb 2.1
+          --debug                Enable debug logging
+          --verbose              Enable verbose logging
+      -o, --output <file>        Filename for writing results (default is stdout). Will append to file if it exists.
+      -v, --version              Show version
 `
 
 func main() {
-	var host, username, password, hash, domain, socksIP, backupFilename, outputFilename, targetIP, dcIP, aesKey string
-	var port, dialTimeout, socksPort, relayPort int
-	var debug, noEnc, forceSMB2, localUser, dump, version, verbose, relay, noPass, sam, lsaSecrets, dcc2, modifyDacl, backupDacl, restoreDacl, kerberos bool
+	var host, username, password, hash, domain, socksHost, backupFilename, outputFilename, targetIP, dcIP, aesKey, dnsHost string
+	var port, socksPort, relayPort int
+	var debug, noEnc, forceSMB2, localUser, dump, version, verbose, relay, noPass, sam, lsaSecrets, dcc2, modifyDacl, backupDacl, restoreDacl, kerberos, dnsTCP bool
+	var dialTimeout time.Duration
 	var err error
 
 	flag.Usage = func() {
@@ -806,13 +816,13 @@ func main() {
 	flag.BoolVar(&forceSMB2, "smb2", false, "")
 	flag.BoolVar(&localUser, "local", false, "")
 	flag.BoolVar(&dump, "dump", false, "")
-	flag.IntVar(&dialTimeout, "t", 5, "")
-	flag.IntVar(&dialTimeout, "timeout", 5, "")
+	flag.DurationVar(&dialTimeout, "t", time.Second*5, "")
+	flag.DurationVar(&dialTimeout, "timeout", time.Second*5, "")
 	flag.BoolVar(&version, "v", false, "")
 	flag.BoolVar(&version, "version", false, "")
 	flag.BoolVar(&relay, "relay", false, "")
 	flag.IntVar(&relayPort, "relay-port", 445, "")
-	flag.StringVar(&socksIP, "socks-host", "", "")
+	flag.StringVar(&socksHost, "socks-host", "", "")
 	flag.IntVar(&socksPort, "socks-port", 1080, "")
 	flag.BoolVar(&noPass, "no-pass", false, "")
 	flag.BoolVar(&noPass, "n", false, "")
@@ -830,6 +840,8 @@ func main() {
 	flag.StringVar(&targetIP, "target-ip", "", "")
 	flag.StringVar(&dcIP, "dc-ip", "", "")
 	flag.StringVar(&aesKey, "aes-key", "", "")
+	flag.StringVar(&dnsHost, "dns-host", "", "")
+	flag.BoolVar(&dnsTCP, "dns-tcp", false, "")
 
 	flag.Parse()
 
@@ -839,6 +851,7 @@ func main() {
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msscmr", "msscmr", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 		log.SetLogLevel(golog.LevelDebug)
@@ -848,6 +861,7 @@ func main() {
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msscmr", "msscmr", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 		log.SetLogLevel(golog.LevelInfo)
@@ -857,6 +871,7 @@ func main() {
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msscmr", "msscmr", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelNotice, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 	}
 
@@ -910,6 +925,44 @@ func main() {
 		defer outputFile.Close()
 	}
 
+	// Validate format
+	if isFlagSet("dns-host") {
+		parts := strings.Split(dnsHost, ":")
+		if len(parts) < 2 {
+			if dnsHost != "" {
+				dnsHost += ":53"
+				parts = append(parts, "53")
+				log.Infof("No port number specified for --dns-host so assuming port 53")
+			} else {
+				fmt.Println("Invalid --dns-host")
+				flag.Usage()
+				return
+			}
+		}
+		ip := net.ParseIP(parts[0])
+		if ip == nil {
+			fmt.Println("Invalid --dns-host. Not a valid ip host address")
+			flag.Usage()
+			return
+		}
+		p, err := strconv.ParseUint(parts[1], 10, 32)
+		if err != nil {
+			fmt.Printf("Invalid --dns-host. Failed to parse port: %s\n", err)
+			return
+		}
+		if p < 1 {
+			fmt.Println("Invalid --dns-host port number")
+			flag.Usage()
+			return
+		}
+	}
+
+	if socksHost != "" && socksPort < 1 {
+		fmt.Println("Invalid --socks-port")
+		flag.Usage()
+		return
+	}
+
 	share := ""
 	var hashBytes []byte
 	var aesKeyBytes []byte
@@ -925,14 +978,8 @@ func main() {
 		host = targetIP
 	}
 
-	if socksIP != "" && isFlagSet("timeout") {
-		log.Errorln("When a socks proxy is specified, --timeout is not supported")
-		flag.Usage()
-		return
-	}
-
-	if dialTimeout < 1 {
-		log.Errorln("Valid value for the timeout is > 0 seconds")
+	if dialTimeout < time.Second {
+		log.Errorln("Valid value for the timeout is >= 1 seconds")
 		return
 	}
 
@@ -980,23 +1027,51 @@ func main() {
 		}
 	}
 
+	if dnsHost != "" {
+		protocol := "udp"
+		if dnsTCP {
+			protocol = "tcp"
+		}
+		net.DefaultResolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{
+					Timeout: dialTimeout,
+				}
+				return d.DialContext(ctx, protocol, dnsHost)
+			},
+		}
+	}
+
 	smbOptions := smb.Options{
 		Host:              targetIP,
 		Port:              port,
 		DisableEncryption: noEnc,
 		ForceSMB2:         forceSMB2,
-		//DisableSigning: true,
+	}
+
+	if socksHost != "" {
+		dialSocksProxy, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%d", socksHost, socksPort), nil, proxy.Direct)
+		if err != nil {
+			log.Errorln(err)
+			return
+		}
+		smbOptions.ProxyDialer = dialSocksProxy
 	}
 
 	if kerberos {
 		smbOptions.Initiator = &spnego.KRB5Initiator{
-			User:     username,
-			Password: password,
-			Domain:   domain,
-			Hash:     hashBytes,
-			AESKey:   aesKeyBytes,
-			SPN:      "cifs/" + host,
-			DCIP:     dcIP,
+			User:        username,
+			Password:    password,
+			Domain:      domain,
+			Hash:        hashBytes,
+			AESKey:      aesKeyBytes,
+			SPN:         "cifs/" + host,
+			DCIP:        dcIP,
+			DialTimout:  dialTimeout,
+			ProxyDialer: smbOptions.ProxyDialer,
+			DnsHost:     dnsHost,
+			DnsTCP:      dnsTCP,
 		}
 	} else {
 		smbOptions.Initiator = &spnego.NTLMInitiator{
@@ -1008,25 +1083,8 @@ func main() {
 		}
 	}
 
-	// Only if not using SOCKS
-	if socksIP == "" {
-		smbOptions.DialTimeout, err = time.ParseDuration(fmt.Sprintf("%ds", dialTimeout))
-		if err != nil {
-			log.Errorln(err)
-			return
-		}
-	}
-
+	smbOptions.DialTimeout = dialTimeout
 	var session *smb.Connection
-
-	if socksIP != "" {
-		dialSocksProxy, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%d", socksIP, socksPort), nil, proxy.Direct)
-		if err != nil {
-			log.Errorln(err)
-			return
-		}
-		smbOptions.ProxyDialer = dialSocksProxy
-	}
 
 	if relay {
 		smbOptions.RelayPort = relayPort
@@ -1081,8 +1139,18 @@ func main() {
 	// Open connection to Windows Remote Registry pipe
 	f, err := session.OpenFile(share, msrrp.MSRRPPipe)
 	if err != nil {
-		log.Errorln(err)
-		return
+		if err == smb.StatusMap[smb.StatusPipeNotAvailable] {
+			// RemoteRegistry is not running but by requesting the pipe name it might be automatically started!
+			time.Sleep(time.Second * 2)
+			f, err = session.OpenFile(share, msrrp.MSRRPPipe)
+			if err != nil {
+				log.Errorln(err)
+				return
+			}
+		} else {
+			log.Errorln(err)
+			return
+		}
 	}
 	defer f.CloseFile()
 
